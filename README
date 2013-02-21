@@ -1,0 +1,15 @@
+0.0.2 
+[completed]
+	1) 	put ip.conf and slurm-serverd in /etc, and make install/uninstall can 
+		be executed
+	2) 	use libevent and buffer event to setup the non-blocking socket 
+		
+[to do]
+	1)	problems:
+		after make install, daemon can not be started properly
+		/etc/init.d/slurm-serverd start
+		/etc/init.d/slurm-serverd status  
+		with some problem.
+[notice]
+	1) non_blocking socket connection with libevent and select are provided
+		 

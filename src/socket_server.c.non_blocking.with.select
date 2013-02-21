@@ -1,0 +1,212 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+#include <sys/select.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <stdint.h>
+
+#include <unistd.h>
+#include <fcntl.h>
+
+#include "info.h"
+#include "allocate.h"
+
+#define SIZE    		8192
+#define LISTEN_BACKLOG 	32
+
+
+static void operation(char *cmd_rcv, char *buf_rt, int fd);
+static void parse_allocate_params(char *cmd, uint32_t *request_node_num,
+			char *node_range_list, char *flag, size_t *timeout);
+static int set_nonblocking(int fd);
+
+
+static void operation(char *cmd_rcv, char *buf_rt, int fd)
+{
+	uint16_t nodes, slots;
+	int rt;
+
+	//identify the cmd
+	if(!strcasecmp(cmd_rcv, "get total node and slot no")){
+		rt = get_total_nodes_slots_no(&nodes, &slots);
+		if(rt == 0)
+			sprintf(buf_rt, "total_nodes=%d total_slots=%d", nodes, slots);
+		else
+			strcpy(buf_rt, "query failure...");
+	}else if(!strcasecmp(cmd_rcv, "get available node and slot no")){
+		rt = get_free_nodes_slots_no(&nodes, &slots);
+		if(rt == 0)
+			sprintf(buf_rt, "available_nodes=%d available_slots=%d", nodes, slots);
+		else
+			strcpy(buf_rt, "query failure...");
+	}else if(!strncasecmp(cmd_rcv, "allocate", 8)){
+		uint32_t request_node_num = 0;
+		char node_range_list[SIZE] = "";  //if not specified, by default
+		char flag[16] = "optional";		//if not specified, by default
+		size_t timeout = 15;			//if not specified, by default
+
+		uint32_t jobid;
+		char reponse_node_list[SIZE];
+
+		parse_allocate_params(cmd_rcv, &request_node_num,
+					node_range_list, flag, &timeout);
+
+		rt = allocate_nodes(request_node_num, node_range_list, &jobid,
+								reponse_node_list, flag, timeout, fd);
+		if(rt == 0)
+			sprintf(buf_rt, "%s", reponse_node_list);
+		else
+			strcpy(buf_rt, "allocate failure..");
+	}
+}
+
+static void parse_allocate_params(char *cmd, uint32_t *request_node_num,
+			char *node_range_list, char *flag, size_t *timeout)
+{
+	char char_array[SIZE];
+	strcpy(char_array, cmd);
+	char *p_str;
+	char *pos;
+
+	p_str = strtok(char_array, " ");
+	while(p_str){
+		if(strstr(p_str, "N=")){
+			pos =  strchr(p_str, '=');
+			*request_node_num = atoi(pos+1);
+		}else if(strstr(p_str, "node_list")){
+			pos = strchr(p_str, '=');
+			strcpy(node_range_list, pos+1);
+		}else if(strstr(p_str, "flag")){
+			pos = strchr(p_str, '=');
+			strcpy(flag, pos+1);
+		}else if(strstr(p_str, "timeout")){
+			pos = strchr(p_str, '=');
+			*timeout = atol(pos+1);
+		}
+		p_str = strtok(NULL, " ");
+	}
+}
+
+static int set_nonblocking(int fd)
+{
+    int flags;
+
+    /* If they have O_NONBLOCK, use the Posix way to do it */
+#if defined(O_NONBLOCK)
+    /* Fixme: O_NONBLOCK is defined but broken on SunOS 4.1.x and AIX 3.2.5. */
+    if (-1 == (flags = fcntl(fd, F_GETFL, 0)))
+        flags = 0;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#else
+    /* Otherwise, use the old way of doing it */
+    flags = 1;
+    return ioctl(fd, FIOBIO, &flags);
+#endif
+}
+
+int running(char *ip, uint32_t listen_port)
+{
+    int socket_fd, new_soc_fd, i_fd;
+    struct sockaddr_in address, addr;
+    fd_set readset, tempset;
+    int max, ret;
+    struct timeval tv;
+    socklen_t sock_len;
+
+    if(socket_fd = socket(AF_INET, SOCK_STREAM, 0), socket_fd < 0){
+    	perror("ERROR: socket");
+    	exit(-1);
+    }
+
+    bzero((void *)&address, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = inet_addr(ip);
+    address.sin_port =  htons(listen_port);
+
+    if(bind(socket_fd, (struct sockaddr *)&address, sizeof(address)) < 0){
+    	perror("ERROR: bind");
+    	exit(-1);
+    }
+
+    if(listen(socket_fd, LISTEN_BACKLOG) < 0){
+    	perror("ERROR: listen");
+    	exit(-1);
+    }
+
+    set_nonblocking(socket_fd);
+
+    // First: Set the "sets"
+    FD_ZERO(&readset);
+	FD_SET(socket_fd, &readset);
+	max = socket_fd;
+	tv.tv_sec = 5;
+	tv.tv_usec = 500;
+
+	while(1){
+		/*Copy readset into the temporary set*/
+		memcpy(&tempset, &readset, sizeof(readset));
+
+		/*Wait for read events*/
+		//int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout);
+		ret = select(max+1, &tempset, (fd_set*)NULL, (fd_set*)NULL, &tv);
+
+		if(ret < 0){
+			perror("ERROR: select");
+		}else if(ret == 0){
+			continue; //no data within timeout
+		}else{
+			// Process new connections first
+			if (FD_ISSET(socket_fd, &tempset)) {
+				// New connection, do something
+				new_soc_fd = accept(socket_fd, (struct sockaddr *)&addr, &sock_len);
+	//			new_soc_fd = accept(socket_fd, NULL, NULL);
+
+				printf("new_soc_fd = %d\n", new_soc_fd);
+
+				//set new_soc_fd into tempset is also needed???
+				FD_SET(new_soc_fd, &readset);
+				if (new_soc_fd > max)
+					max = new_soc_fd;
+				//don't read from the server's socket_fd
+				FD_CLR(socket_fd, &tempset);
+			}
+
+			 // Process events of other sockets...
+			for (i_fd = 0; i_fd <= max; i_fd++) {
+				char recv_buf[SIZE], send_buf[SIZE];
+
+				if (FD_ISSET(i_fd, &tempset)) {
+					// Process data from socket i
+					ret = read(i_fd, (void*)recv_buf, SIZE);
+					//if no data from i_fd anymore, close it
+					if (ret <= 0) {
+						// Closed connection or error
+						FD_CLR(i_fd, &readset);
+						// check max
+						if(i_fd == max)
+							max = max - 1;
+						// Do some cleaning
+						shutdown(i_fd, SHUT_RDWR);
+						close(i_fd);
+					} else {
+						printf("new_soc_fd = %d, recv from client: %s\n", new_soc_fd, recv_buf);
+
+						operation(recv_buf, send_buf, i_fd);
+
+						if(write(i_fd, send_buf, strlen(send_buf)+1) < 0){
+							slurm_perror("ERROR: write");
+						}
+
+						printf("send to client: %s\n", send_buf);
+					}
+				}
+			}//end for
+		}//end if
+	}
+    return 0;
+}

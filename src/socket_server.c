@@ -1,0 +1,205 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+#include <sys/select.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <stdint.h>
+
+#include <event2/event.h>
+#include <event2/bufferevent.h>
+
+#include "info.h"
+#include "allocate.h"
+
+#define SIZE    		8192
+#define LISTEN_BACKLOG 	32
+
+static void parse_allocate_params(char *cmd, uint32_t *request_node_num,
+			char *node_range_list, char *flag, size_t *timeout);
+static void operation(char *cmd_rcv, char *buf_rt, int fd);
+
+static void read_cb(struct bufferevent *bev, void *arg);
+static void error_cb(struct bufferevent *bev, short event, void *arg);
+static void do_accept_cb(evutil_socket_t sockfd, short event_type, void *arg);
+
+
+static void operation(char *cmd_rcv, char *buf_rt, int fd)
+{
+	uint16_t nodes, slots;
+	int rt;
+
+	//identify the cmd
+	if(!strcasecmp(cmd_rcv, "get total node and slot no")){
+		rt = get_total_nodes_slots_no(&nodes, &slots);
+		if(rt == 0)
+			sprintf(buf_rt, "total_nodes=%d total_slots=%d", nodes, slots);
+		else
+			strcpy(buf_rt, "query failure...");
+	}else if(!strcasecmp(cmd_rcv, "get available node and slot no")){
+		rt = get_free_nodes_slots_no(&nodes, &slots);
+		if(rt == 0)
+			sprintf(buf_rt, "available_nodes=%d available_slots=%d", nodes, slots);
+		else
+			strcpy(buf_rt, "query failure...");
+	}else if(!strncasecmp(cmd_rcv, "allocate", 8)){
+		uint32_t request_node_num = 0;
+		char node_range_list[SIZE] = "";  //if not specified, by default
+		char flag[16] = "optional";		//if not specified, by default
+		size_t timeout = 15;			//if not specified, by default
+
+		uint32_t jobid;
+		char reponse_node_list[SIZE];
+
+		parse_allocate_params(cmd_rcv, &request_node_num,
+					node_range_list, flag, &timeout);
+
+		rt = allocate_nodes(request_node_num, node_range_list, &jobid,
+								reponse_node_list, flag, timeout, fd);
+		if(rt == 0)
+			sprintf(buf_rt, "%s", reponse_node_list);
+		else
+			strcpy(buf_rt, "allocate failure..");
+	}
+}
+
+static void parse_allocate_params(char *cmd, uint32_t *request_node_num,
+			char *node_range_list, char *flag, size_t *timeout)
+{
+	char char_array[SIZE];
+	strcpy(char_array, cmd);
+	char *p_str;
+	char *pos;
+
+	p_str = strtok(char_array, " ");
+	while(p_str){
+		if(strstr(p_str, "N=")){
+			pos =  strchr(p_str, '=');
+			*request_node_num = atoi(pos+1);
+		}else if(strstr(p_str, "node_list")){
+			pos = strchr(p_str, '=');
+			strcpy(node_range_list, pos+1);
+		}else if(strstr(p_str, "flag")){
+			pos = strchr(p_str, '=');
+			strcpy(flag, pos+1);
+		}else if(strstr(p_str, "timeout")){
+			pos = strchr(p_str, '=');
+			*timeout = atol(pos+1);
+		}
+		p_str = strtok(NULL, " ");
+	}
+}
+
+static void read_cb(struct bufferevent *bev, void *arg)
+{
+    char rec_buf[SIZE], send_buf[SIZE];
+    evutil_socket_t fd;
+
+    if(fd = bufferevent_getfd(bev), fd < 0){
+    	perror("ERROR: bufferevent_getfd");
+    	exit(1);
+    }
+    /*read msg sent from client into rec_buf*/
+    if(bufferevent_read(bev, rec_buf, SIZE) > 0) {
+    	puts("===========jimmy=============");
+    	printf("AA: received from client: %s\n", rec_buf);
+    	/*interact with slurm, then fill result into send_buf*/
+        operation(rec_buf, send_buf, fd);
+        /*send result to client*/
+        bufferevent_write(bev, send_buf, strlen(send_buf)+1);
+        printf("BB: send to client: %s\n", send_buf);
+    }
+}
+
+//void write_cb(struct bufferevent *bev, void *arg) {}
+
+static void error_cb(struct bufferevent *bev, short error, void *arg)
+{
+    evutil_socket_t fd = bufferevent_getfd(bev);
+    printf("fd = %u, ", fd);
+    if (error & BEV_EVENT_TIMEOUT) {
+        printf("Timed out\n"); //if bufferevent_set_timeouts() called
+    }else if (error & BEV_EVENT_EOF) {
+        printf("connection closed\n");
+    }else if (error & BEV_EVENT_ERROR) {
+        printf("some other error\n");
+    }
+    bufferevent_free(bev);
+}
+/*
+ * typedef void(* event_callback_fn)(evutil_socket_t sockfd, short event_type, void *arg)
+ */
+static void do_accept_cb(evutil_socket_t sockfd, short event_type, void *arg)
+{
+    evutil_socket_t fd;
+    struct sockaddr_in sin;
+    socklen_t slen;
+
+    struct event_base *base;
+	struct bufferevent *bev;
+
+    if(fd = accept(sockfd, (struct sockaddr *)&sin, &slen), fd < 0){
+    	perror("ERROR: accept");
+    	exit(-1);
+    }
+
+    base = (struct event_base *)arg;
+    /*create a buffer event*/
+    bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
+    /*set call back function: read, write, error*/
+    bufferevent_setcb(bev, read_cb, NULL, error_cb, arg);
+    bufferevent_enable(bev, EV_READ|EV_WRITE|EV_PERSIST);
+}
+
+int running(char *ip, uint32_t listen_port)
+{
+    evutil_socket_t socket_fd;
+    struct sockaddr_in address;
+    struct event_base *base;
+    struct event *listen_event;
+
+    if(socket_fd = socket(AF_INET, SOCK_STREAM, 0), socket_fd < 0){
+    	perror("ERROR: socket");
+    	exit(-1);
+    }
+    /*set the listen socket reuseable*/
+    evutil_make_listen_socket_reuseable(socket_fd);
+
+    bzero((void *)&address, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = inet_addr(ip);
+    address.sin_port =  htons(listen_port);
+
+    if(bind(socket_fd, (struct sockaddr *)&address, sizeof(address)) < 0){
+    	perror("ERROR: bind");
+    	exit(-1);
+    }
+
+    if(listen(socket_fd, LISTEN_BACKLOG) < 0){
+    	perror("ERROR: listen");
+    	exit(-1);
+    }
+
+    /*set socket non-blocking*/
+    evutil_make_socket_nonblocking(socket_fd); //also can use POSIX fcntl
+    /*create an event base */
+    if(base = event_base_new(), base == NULL){
+    	perror("ERROR: event_base_new");
+    	exit(-1);
+    }
+    /*
+     *create an event, specify the event type, bind with callback function and its params.
+     *for a listen socket, event type for listening can be EV_READ|EV_PERSIST.
+     */
+    listen_event = event_new(base, socket_fd, EV_READ|EV_PERSIST, do_accept_cb, (void*)base);
+    event_add(listen_event, NULL); //struct timeval*, NULL: no timeout, wait forever
+    /*start the event*/
+    event_base_dispatch(base);
+
+    puts("The End.");
+    return 0;
+}

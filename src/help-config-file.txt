@@ -1,0 +1,10 @@
+ -*- text -*-
+#
+#
+
+by default, while "slurm-server" is installed under ${prefix}/bin, 
+while "ip.conf" is installed under ${prefix}/etc.
+
+Therefore, in slurm_server.c, 
+	#define IP_CONFIG_FILE "../etc/ip.conf"
+		

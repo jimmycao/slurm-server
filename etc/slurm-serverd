@@ -1,0 +1,57 @@
+#!/bin/sh
+#
+# chkconfig: 2345  80 50
+# description: slurm-server is for setup the socket at slurm side
+#             
+# processname: slurm-server 
+#
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+ret=0
+ 
+start() {
+	echo "start slurm-server, setup the socket.."
+	daemon /usr/local/bin/slurm-server &
+	ret=$?
+	exit $ret
+}
+
+stop() {
+	echo "stop slurm-server"
+	kill $(ps -ef | grep slurm-server | grep -v grep | awk '{print $2}')
+	ret=$?
+}
+ 
+status() {
+	sleep 2
+	local result
+	echo "check status of slurm-server..."
+	result=$( ps aux|grep slurm-server|grep -v grep| awk '{print $8}' )
+	echo "result=$result"	
+	#if [ "$result" = "Ss" -o "$result" = "R+" ]; then
+	if [ "$result" = "Ss" ] || [ "$result" = "R+" ]; then
+		echo "slurm-server is up"
+		ret=0
+	else
+		echo "slurm-server is down"
+		ret=1
+	fi
+}
+ 
+case "$1" in
+	start)
+        	start
+        	;;
+  	stop)
+        	stop
+        	;;
+  	status)
+          	status
+        	;;
+  	*)
+		echo $"Usage: $0 {start|stop|status}"
+		exit 1
+esac
+ 
+exit $ret
